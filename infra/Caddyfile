@@ -1,0 +1,79 @@
+# infra/Caddyfile
+{
+  email {$ACME_EMAIL}
+  servers {
+    protocols h1 h2 h3
+    timeouts {
+      read_header 10s
+      idle 2m
+    }
+  }
+}
+
+{$DOMAIN} {
+  log {
+    output stdout
+    format json
+  }
+
+  header {
+    Strict-Transport-Security "max-age=31536000; includeSubDomains"
+    X-Content-Type-Options "nosniff"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    Permissions-Policy "camera=(self), geolocation=(), microphone=()"
+    -Server
+  }
+
+  # Block internal endpoints
+  @internal path /metrics /metrics/* /api/v1/internal/*
+  respond @internal 404
+
+  # SSE events: no buffering, no compression
+  handle /api/v1/events/stream {
+    reverse_proxy api:8000 {
+      flush_interval -1
+      transport http {
+        dial_timeout 3s
+        response_header_timeout 15s
+      }
+      header_down Cache-Control "no-cache, no-transform"
+      header_down X-Accel-Buffering "no"
+    }
+  }
+
+  # Webhooks: max 256KB body
+  handle /api/v1/webhooks/* {
+    request_body {
+      max_size 256KB
+    }
+    reverse_proxy api:8000
+  }
+
+  # REST API: gzip & zstd
+  handle /api/* {
+    encode zstd gzip
+    request_body {
+      max_size 1MB
+    }
+    reverse_proxy api:8000 {
+      transport http {
+        dial_timeout 3s
+        response_header_timeout 30s
+      }
+    }
+  }
+
+  # Operational health checks
+  handle /healthz {
+    reverse_proxy api:8000
+  }
+  handle /readyz {
+    reverse_proxy api:8000
+  }
+
+  # Next.js web application
+  handle {
+    encode zstd gzip
+    reverse_proxy web:3000
+  }
+}
