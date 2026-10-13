@@ -1,0 +1,162 @@
+# infra/docker-compose.yml
+name: campuslaundry-${APP_ENV:-prod}
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-backend-env: &backend-env
+  env_file: [.env]
+  environment:
+    TZ: UTC
+
+services:
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports: ["80:80", "443:443", "443:443/udp"]
+    environment:
+      DOMAIN: ${DOMAIN:-app.campuslaundry.example}
+      ACME_EMAIL: ${ACME_EMAIL:-admin@campuslaundry.example}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on: [api, web]
+    networks: [edge]
+    mem_limit: 128m
+    logging: *default-logging
+
+  web:
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    image: campuslaundry-web:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    env_file: [.env]
+    environment:
+      NODE_ENV: production
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [edge]
+    mem_limit: 384m
+    logging: *default-logging
+
+  api:
+    build:
+      context: ../backend
+      dockerfile: Dockerfile
+    image: campuslaundry-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    <<: *backend-env
+    command: >
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-2} --proxy-headers --forwarded-allow-ips="*" --timeout-graceful-shutdown 20
+    stop_grace_period: 30s
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request as u; u.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    ulimits:
+      nofile: {soft: 8192, hard: 8192}
+    networks: [edge, backend]
+    mem_limit: 1g
+    logging: *default-logging
+
+  worker:
+    image: campuslaundry-api:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    <<: *backend-env
+    command: ["python", "-m", "app.worker"]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      redis: {condition: service_healthy}
+    stop_grace_period: 30s
+    networks: [edge, backend]
+    mem_limit: 512m
+    logging: *default-logging
+
+  migrate:
+    image: campuslaundry-api:${IMAGE_TAG:-latest}
+    restart: "no"
+    <<: *backend-env
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres: {condition: service_healthy}
+    networks: [backend]
+    logging: *default-logging
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-campuslaundry}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres_dev_password}
+      TZ: UTC
+    command: >
+      postgres -c max_connections=100
+               -c shared_buffers=${PG_SHARED_BUFFERS:-256MB}
+               -c effective_cache_size=${PG_EFFECTIVE_CACHE:-768MB}
+               -c work_mem=8MB
+               -c maintenance_work_mem=64MB
+               -c wal_compression=on
+               -c log_min_duration_statement=250
+               -c idle_in_transaction_session_timeout=30000
+               -c statement_timeout=15000
+               -c timezone=UTC
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-campuslaundry}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+    mem_limit: 1536m
+    logging: *default-logging
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: >
+      redis-server --requirepass ${REDIS_PASSWORD:-redis_dev_password}
+                   --appendonly yes
+                   --appendfsync everysec
+                   --maxmemory 256mb
+                   --maxmemory-policy volatile-lru
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a $$REDIS_PASSWORD ping | grep -q PONG"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-redis_dev_password}
+    networks: [backend]
+    mem_limit: 320m
+    logging: *default-logging
+
+networks:
+  edge: {}
+  backend: {}
+
+volumes:
+  pgdata:
+  redisdata:
+  caddy_data:
+  caddy_config:
